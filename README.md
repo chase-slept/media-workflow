@@ -20,6 +20,8 @@ This repository is the home for my Media Workflow **documentation**, meant to de
   - [Recap 1](#recap-1)
   - [Webhook](#webhook)
   - [Jellyseerr Webhook Notifications](#jellyseerr-webhook-notifications)
+  - [Webhook Script](#webhook-script)
+  - [LFTP](#lftp)
 
 ## Acknowledgment
 
@@ -53,6 +55,7 @@ This is kind of a 'best of both worlds' where locally, users have a large librar
 ## Outline of Workflow
 
 ![Diagram of media workflow](assets/MediaWorkflowV1.png)
+(You may want to click to expand the image for better viewing.)
 
 This diagram is a little bit busy, so we'll walk through it from where the workflow actually begins---the Jellyseerr request.
 
@@ -124,7 +127,7 @@ Once everything is configured, be sure to test that everything is working by fol
 
 ### Jellyfin (Remote)
 
-Since our remote users are using the high-bandwidth server for Jellyfin, we need to configure a few things. In the ruTorrent settings under Autotools, I enabled the "AutoMove with a filter to match `/movies|shows/` and set the path to finished downloads to `/home/slept/media`, change the operation type to 'hard link', and enable "Add torrent's label to path". This is the path we'll use for media files in the Jellyfin instance that runs on the remote server. Hardlinking the completed files to this directory will prevent us from having to actually move or copy any files, which will allow the torrents to continue seeding if needed and prevent duplicate files from taking up our limited storage. When it comes time to delete files to make room, we'll only need to remove files from this media folder as, presumably, Sonarr/Radarr will have removed the original download files since we configured it to do so earlier. Create user accounts for any remote users and that completes the configuration for Jellyfin. Remember, our local Jellyseerr instance doesn't interface with this Jellyfin at all, so the user accounts we create won't be able to be used with Jellyseerr--a separate user account will need to be made for remote users to create media requests.
+Since our remote users are using the high-bandwidth server for Jellyfin, we need to configure a few things. In the ruTorrent settings under Autotools, I enabled the "AutoMove with a filter" to match `/movies|shows/` and set the path to finished downloads to `/home/slept/media`, changed the operation type to 'hard link', and enabled "Add torrent's label to path". This is the path we'll use for media files in the Jellyfin instance that runs on the remote server. Hardlinking the completed files to this directory will prevent us from having to actually move or copy any files, which will allow the torrents to continue seeding if needed and prevent duplicate files from taking up our limited storage. When it comes time to delete files to make room, we'll only need to remove files from this media folder as, presumably, Sonarr/Radarr will have removed the original download files since we configured it to do so earlier. Create user accounts for any remote users and that completes the configuration for Jellyfin. Remember, our local Jellyseerr instance doesn't interface with this Jellyfin at all, so the user accounts we create won't be able to be used with Jellyseerr--a separate user account will need to be made for remote users to create media requests.
 
 ### Recap 1
 
@@ -163,21 +166,111 @@ For the `webhook.conf` file, which is actually a YAML file (note that I've left 
       name: media.media_type
     - source: payload
       name: subject
-#    - source: payload
-#      name: media.tmdbId
-#    - source: payload
-#      name: media.tvdbId
     - source: payload
       name: issue.issue_id
     - source: payload
       name: message
+#    - source: payload
+#      name: media.tmdbId
+#    - source: payload
+#      name: media.tvdbId
 ```
 
-The YAML file references some payload information that we'll pull from Jellyseerr in just a bit. We'll also need to create the script that's referenced in `execute-command:`. This is what triggers when a webhook is received. My final working script is available [here](https://github.com/chase-slept/sync-script/blob/main/syncV3.sh). I won't paste the whole script here but I'll post some excerpts to help explain as needed. Once everything is created we can start the service with `systemctl` and continue along.
+The YAML file references some payload information that we'll pull from Jellyseerr in just a bit. We'll also need to create the script that's referenced in `execute-command:`. This is what triggers when a webhook is received. My final working script is available [here](https://github.com/chase-slept/sync-script/blob/main/syncV3.sh). I won't paste the whole script here in one chunk but I'll post excerpts to explain as we go along. Once everything is created we can start the service with `systemctl` and continue along.
 
 ### Jellyseerr Webhook Notifications
 
-In Jellyseerr's settings, under "Notifications", I've enabled the Webhook agent and selected the "Issue Reported" and "Issue Reopened" notification types. For the Webhook URL, we can use the local IP of our Pi since Jellyseerr and the Webhook server are on the same network (or a FQDN if you have one--I used Caddy to reverse proxy to one) along with `/hooks/{id}` replacing `id` with the value we named in the hooks file above. The full URL should be `http://10.10.10.10/hooks/script-webhook`. Test that it's working and save; no other changes need to be made here.
+In Jellyseerr's settings, under "Notifications", I've enabled the Webhook agent and selected the "Issue Reported" and "Issue Reopened" notification types. For the Webhook URL, we can use the local IP of our Pi since Jellyseerr and the Webhook server are on the same network (or a FQDN if you have one--I used Caddy to reverse proxy to one) along with `/hooks/{id}` replacing `{id}` with the value we named in the hooks file above. The full URL should be `http://10.10.10.10/hooks/script-webhook`. Test that it's working and save; no other changes need to be made here, but inspecting the JSON Payload provides us with the values we need for our YAML file above. The idea is to grab values that we can use to pass to our script. I've passed `media.media_type` which returns either 'movie' or 'tv', `subject` which returns the media's title, `issue.issue_id` which returns the unique id number of the Jellyseerr issue, and `message` which returns the message submitted with the issue. Passing these values to the script will let us use them to make test statements and logic. Let's look at a bit of the script to see how.
 
+### Webhook Script
+
+To start with, we pass in all of our variables, including any sensitive values in other files (baseURL, in this case).
+
+```bash
+#source for sensitive variables
+source /home/slept/scripts/webhooks/scrts.conf
+
+#variables, passed-in first
+mediaType=$1
+title="${2//[:\']}"
+issueID=$3
+issueMsg="$4"
+
+#URLs
+commentURL="${baseURL}/issue/${issueID}/comment"
+statusURL="${baseURL}/issue/${issueID}/resolved"
+
+#match folder paths to media title
+path="$(find /mnt/data/media/ /mnt/data/media-kids/ -mindepth 1 -maxdepth 2 -type d | grep "$title")"
+find_path #this function is actually defined just above, but for readability I'll omit that and talk about it in a bit
+trimPath="$(find /mnt/data/media/ /mnt/data/media-kids/ -mindepth 1 -maxdepth 2 -type d | grep "$title" | cut -d'/' -f6-)"
+```
+
+When passing in variables from the hooks file, we need to assign them in the order they're listed. `$1` is media.media_type, `$2` is subject, etc. I've renamed the variables here as well, to make it easier to read the script and figure out what it's doing. I've added double quotes to the variables that might possibly include special characters, so that those aren't interpreted if they do occur. I've also added some parameter expansion and substitution to `$2`. Firstly, since titles may contain white space and other characters bash might want to interpret, we use curly braces`{}` to expand the parameter as-is. The `//[:\']` bit that comes after is a string substitution, which I'm using to strip colons and apostrophes from the expanded string. So if a title would have expanded to include these characters, they're instead omitted. This helps with our path-finding logic later on, as when Radarr/Sonarr organize our media, they also strip these invalid characters from any file paths they create. Next we define the comment and status URLs, which we'll use to automate commenting on and closing the Jellyseerr issue our users create. Lastly, we define our `path` and `trimPath` variables, which are actually command expansions that search for the matching paths and trimmed paths, and return those as values.
+
+`path` works by running the `find` command, searching in the local media folders for a directory (`-type d`) that matches (`grep "$title"`) our title. The min/max depth flags tell the find command how many folders deep it should search for matches. `trimPath` uses the same logic and then uses the `cut` command to strip the path to a single directory (so from `/mnt/data/media-kids/movies/Migration (2023)` to `Migration (2023`). The first function, `find_path`, fixes a random issue I encountered with ampersands in titles. `find_path` is called right after `path`, in the event that `path` returns a null value. That function is as follows:
+
+```bash
+#logic to fix path issues
+find_path()
+{
+ [ -z "$path" ] && title="${title//&/and}" && path="$(find /mnt/data/media/ /mnt/data/media-kids/ -mindepth 1 -maxdepth 2 -type d | grep "$title")" || echo "$title"
+}
+```
+
+The first thing we test for here with `[ -z "$path" ]` is whether the path is null, or has no value. During testing this happened with a few titles that Sonarr/Radarr replaced an `&` with `and`, which meant it no longer matched the passed-in title. Not sure why it does this, as in almost every other case it sticks strictly to the title (these titles are pulled from sources like TVDB and TMDB); in some cases, it even leaves the ampersand (Batman & Robin)! Makes no sense to me, but we can test for it like this. If that first test passes it means the path doesn't match for some reason and returned a null value, then proceeds to the next command with `&&`. The next two commands work together with `title="${title//&/and}"` replacing the ampersand with the string "and", and `path="$(find /mnt/data/media/ /mnt/data/media-kids/ -mindepth 1 -maxdepth 2 -type d | grep "$title")"` runs right after and uses the same logic as the `path` command expansion. So basically we've rewritten the title and ran the command again, hoping the ampersand was issue. We follow this with `||` to move from the "if" portion of our test to the "else" portion, with `echo "$title"` simply returning the unaltered title (we just needed to finish the if/else logic, really).
+
+The next functions, `generate_post_data` and `comment_and_close` are used to create some message text and to send that generated message and close the corresponding Jellyseerr issue. These are simple POSTs sent to Jellyseerr via API. 
+
+```bash
+##function to generate issue comment data
+generate_post_data()
+{
+        cat <<EOF
+{
+    "message": "Items queued for transfer, closing issue. Upload speed is very slow, it may take quite some time for Series to transfer!"
+}
+EOF
+}
+
+#function to comment/close issue via api
+comment_and_close()
+{
+        curl -X POST -L "${commentURL}" \
+                -H 'Content-Type: application/json' \
+                -H "X-Api-Key: ${apiKey}" \
+                --data "$(generate_post_data)" &&
+        curl -X POST -L "${statusURL}" \
+                -H 'Content-Type: application/json' \
+                -H "X-Api-Key: ${apiKey}"
+}
+```
+
+Lastly comes the actual script logic to make use of all of these variables and functions we've defined. I'll walk through this bit by bit, but it's pretty self-explanatory:
+
+```bash
+if grep -q -i "unava" <<< "$issueMsg"; then
+echo "It matches test: 'unavailable'"
+```
+
+First we check if our message text contains the case-insensitive string "unava". This is simply to limit the script from running on other types of issues. Users were instructed to add the text "unavailable" to their issues when requesting existing media, and this is why. In the event a separate issue is reported, the script won't run.
+
+```bash
+case $mediaType in
+  movie)
+    cp -Rlv "$path" "/mnt/data/sync/movies/$trimPath" &&
+    comment_and_close
+    ;;
+  tv)
+    cp -Rlv "$path" "/mnt/data/sync/shows/$trimPath" &&
+        comment_and_close
+    ;;
+esac
+fi
+```
+
+Next, we perform a case statement, which checks the `$mediaType` for 'movie' or 'tv', and performs the commands listed after each condition. The commands are to `cp` (recursively copy) the files we matched earlier at `$path` to the new location `/mnt/data/sync/(movies or tv)/`, which is our LFTP sync folder. We use `$trimPath` here to create a new folder in that sync directory so that our files are still organized when they are transferred to the remote server. `&& comment_and_close` is used to run our function to automatically comment on and close the Jellyfin issue our user opened. If everything works as intended (it does! I've checked the logs!), our files will hardlink to the sync directory to be transferred, since we've used the `-l` flag with the `cp` command. This makes the process instant and prevents duplicating files and taking up extra storage space. With our files ready to transfer in a neatly organized sync folder, the last thing to do is setup LFTP to transfer them over to the remote server.
+
+### LFTP
 
 More documentation pending ...
