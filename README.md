@@ -17,7 +17,7 @@ This repository is the home for my Media Workflow **documentation**, meant to de
   - [MQTT with Mosquitto](#mqtt-with-mosquitto)
   - [Q4D Install Notes](#q4d-install-notes)
   - [Jellyfin (Remote)](#jellyfin-remote)
-  - [Recap 1](#recap-1)
+  - [Recap](#recap)
   - [Webhook](#webhook)
   - [Jellyseerr Webhook Notifications](#jellyseerr-webhook-notifications)
   - [Webhook Script](#webhook-script)
@@ -47,9 +47,9 @@ This is kind of a 'best of both worlds' where locally, users have a large librar
 
 - Create write-up or README for media workflow
 - Create/Tie in other repos/projects:
-  - LFTP script x2
-  - MQTT script and documentation
-  - Webhook documentation
+  - ~~LFTP script x2~~
+  - ~~MQTT script and documentation~~
+  - ~~Webhook documentation~~
   - ~~sync-script~~
 
 ## Outline of Workflow
@@ -129,7 +129,7 @@ Once everything is configured, be sure to test that everything is working by fol
 
 Since our remote users are using the high-bandwidth server for Jellyfin, we need to configure a few things. In the ruTorrent settings under Autotools, I enabled the "AutoMove with a filter" to match `/movies|shows/` and set the path to finished downloads to `/home/slept/media`, changed the operation type to 'hard link', and enabled "Add torrent's label to path". This is the path we'll use for media files in the Jellyfin instance that runs on the remote server. Hardlinking the completed files to this directory will prevent us from having to actually move or copy any files, which will allow the torrents to continue seeding if needed and prevent duplicate files from taking up our limited storage. When it comes time to delete files to make room, we'll only need to remove files from this media folder as, presumably, Sonarr/Radarr will have removed the original download files since we configured it to do so earlier. Create user accounts for any remote users and that completes the configuration for Jellyfin. Remember, our local Jellyseerr instance doesn't interface with this Jellyfin at all, so the user accounts we create won't be able to be used with Jellyseerr--a separate user account will need to be made for remote users to create media requests.
 
-### Recap 1
+### Recap
 
 So to recap where we are now in relation to our diagram. Remote or local users create a media request in Jellyseerr. This gets sent to Sonarr/Radarr, which processes the request and sends the download to the remote download client with a "shows" or "movies" label. Once the download completes, the torrent client sends a trigger to our MQTT broker, which uses the label to assign a type-code along with the torrent hash to create a message. This message is queued and published by the broker on the remote server and the subscribed client (our local server) receives the message and runs the Q4D client script. The script spawns the LFTP job to download the file(s) from the remote server to the relevant path on the local server. This whole process should take just a few minutes. So far, we've accomplished most of what we wanted in our big list of problems to solve above. All that's left is to deal with transferring **existing media** from the local server to the remote, which is sort of the inverse of what we just accomplished. A big caveat here as it pertains to my local network: since my upload speed is so low, segmenting the downloads with LFTP actually isn't very helpful, and just tanks my home network speeds. I've addressed this by warning my users and adding a message when they make requests. One day I'll have better upload speed, and this whole workflow will become essentially moot, haha! Until then, lets continue with the elaborate workaround.
 
@@ -170,10 +170,6 @@ For the `webhook.conf` file, which is actually a YAML file (note that I've left 
       name: issue.issue_id
     - source: payload
       name: message
-#    - source: payload
-#      name: media.tmdbId
-#    - source: payload
-#      name: media.tvdbId
 ```
 
 The YAML file references some payload information that we'll pull from Jellyseerr in just a bit. We'll also need to create the script that's referenced in `execute-command:`. This is what triggers when a webhook is received. My final working script is available [here](https://github.com/chase-slept/sync-script/blob/main/syncV3.sh). I won't paste the whole script here in one chunk but I'll post excerpts to explain as we go along. Once everything is created we can start the service with `systemctl` and continue along.
@@ -273,4 +269,23 @@ Next, we perform a case statement, which checks the `$mediaType` for 'movie' or 
 
 ### LFTP
 
-More documentation pending ...
+Back on our remote server, we need to configure a few things to get our LFTP script up and running. The final LFTP script is available [here](https://github.com/chase-slept/lftp-sync); more info about how the script works can be found there as well. In short, the script will connect to our Raspberry Pi via SSH and transfer any new files from the sync folder we configured above. Since we're connecting via SSH, we'll need to set that up, so let's tackle that first.
+
+In order to create a secure connection to our local server, I've used an SSH Jump Host to connect back home to our Raspberry Pi using my VPS as a secure Bastion server. This is configured in the SSH config file on our remote server, which I've sanitized below:
+
+```
+Host vps
+  HostName <IP to Bastion Server>
+  User slept
+
+Host pi.jump
+  HostName <local IP to Raspberry Pi>
+  User slept
+  ProxyJump vps
+```
+
+When the LFTP script runs it will connect via SFTP to the `pi.jump` host (this is the `${HOST}` we specify in the script). Note the `ProxyJump` command here points to the other SSH host, our VPS. This creates an encrypted SSH connection to our Pi by using the VPS as a 'jump' in between the two servers. On the VPS, we need to make sure there is an SSH host configured to connect to the Pi. What's happening here is we're essentially piggybacking off of this SSH connection on the VPS, assuming our bastion server is more secure overall (which in my case is true, the VPS is pretty well hardened at this point).
+
+With our SSH rules configured, we just need to configure our script to run on a timer. We can do this by adding the script to our system's crontab with `crontab -e`. I set it to run every minute: `*/1 * * * * /usr/bin/flock -n /tmp/sync.lock /home/slept/scripts/lftpsync.sh >> /home/slept/scripts/log.log 2>&1`. You can see I'm using `flock` here to prevent it from running multiple times and stacking up on itself; the `-n` flag tells flock to throw an error if the lockfile at `/tmp/sync.lock` already exists, rather than waiting for the existing process to finish running. The last parameter is the command flock should run, which in this case is the path to our script. We use `>>` to append the script's output to a file, with `2>&1` telling the shell to print stdout/stderr together in the same log.
+
+With all of this configured, our LFTP script should run every minute and if there are new files waiting in the sync folder on our local Raspberry Pi (sourced from our NFS-mounted NAS), an LFTP job will spawn to initiate their transfer to the remote server. Once the transfer is complete, that media will be available for our remote users on their remote Jellyfin server. That was a lot of work to solve such a small problem!
